@@ -1,0 +1,136 @@
+function financial_transformer_loss(y_pred, y_true, prices; 
+                                   weights=[0.3, 0.4, 0.2, 0.1],
+                                   risk_free_rate=0.02,
+                                   asymmetric_penalty=2.0)
+    
+    N = size(y_pred, 1)
+    
+    # Extract predictions and targets
+    pred_price_change = y_pred[:, 1]
+    pred_direction_prob = y_pred[:, 2]  # Probability of positive movement
+    pred_volatility = y_pred[:, 3]
+    
+    true_price_change = y_true[:, 1]
+    true_direction = y_true[:, 2]  # 1 for up, 0 for down
+    true_volatility = y_true[:, 3]
+    
+    # 1. Directional Accuracy Loss (Binary Cross-Entropy)
+    epsilon = 1e-8  # Numerical stability
+    pred_direction_prob = clamp.(pred_direction_prob, epsilon, 1 - epsilon)
+    
+    direction_loss = -mean(true_direction .* log.(pred_direction_prob) .+ 
+                          (1 .- true_direction) .* log.(1 .- pred_direction_prob))
+    
+    # 2. Price Magnitude Loss (Asymmetric Huber Loss)
+    price_errors = pred_price_change .- true_price_change
+    
+    # Asymmetric penalty: penalize underestimating losses more than gains
+    asymmetric_weights = ifelse.(price_errors .> 0, 1.0, asymmetric_penalty)
+    
+    # Huber loss with asymmetric weighting
+    huber_delta = 0.01  # Threshold for switching from quadratic to linear
+    magnitude_loss = mean(asymmetric_weights .* 
+                         ifelse.(abs.(price_errors) .<= huber_delta,
+                                0.5 .* price_errors.^2,
+                                huber_delta .* (abs.(price_errors) .- 0.5 * huber_delta)))
+    
+    # 3. Risk-Adjusted Performance Loss (Sharpe Ratio based)
+    if length(prices) > 1
+        returns = diff(log.(prices))
+        if std(returns) > 1e-8
+            sharpe_ratio = (mean(returns) - risk_free_rate/252) / std(returns)
+            # Convert to loss (negative Sharpe, bounded)
+            risk_loss = max(0, 1 - sharpe_ratio)
+        else
+            risk_loss = 1.0
+        end
+    else
+        risk_loss = 0.0
+    end
+    
+    # 4. Volatility Prediction Loss (MSE with volatility clustering awareness)
+    vol_errors = pred_volatility .- true_volatility
+    
+    # Weight recent volatility errors more heavily (GARCH-like behavior)
+    time_weights = exp.(-0.1 * (N:-1:1))  # Exponential decay
+    time_weights = time_weights ./ sum(time_weights)  # Normalize
+    
+    volatility_loss = sum(time_weights .* vol_errors.^2)
+    
+    # 5. Regime Change Detection Penalty
+    # Penalize the model for missing significant market shifts
+    price_change_magnitude = abs.(true_price_change)
+    regime_threshold = quantile(price_change_magnitude, 0.95)  # Top 5% moves
+    
+    regime_events = price_change_magnitude .> regime_threshold
+    if any(regime_events)
+        regime_errors = abs.(price_errors[regime_events])
+        regime_penalty = mean(regime_errors) * 2.0  # Extra penalty for missing big moves
+    else
+        regime_penalty = 0.0
+    end
+    
+    # 6. Combine all loss components
+    total_loss = (weights[1] * direction_loss + 
+                  weights[2] * magnitude_loss + 
+                  weights[3] * risk_loss + 
+                  weights[4] * volatility_loss + 
+                  0.1 * regime_penalty)  # Small weight for regime penalty
+    
+    return total_loss, Dict(
+        "direction_loss" => direction_loss,
+        "magnitude_loss" => magnitude_loss, 
+        "risk_loss" => risk_loss,
+        "volatility_loss" => volatility_loss,
+        "regime_penalty" => regime_penalty,
+        "total_loss" => total_loss
+    )
+end
+
+"""
+Gradient computation for the financial loss function
+Returns gradients w.r.t. predictions for backpropagation
+"""
+function financial_loss_gradient(y_pred, y_true, prices; 
+                                weights=[0.3, 0.4, 0.2, 0.1],
+                                asymmetric_penalty=2.0)
+    
+    N = size(y_pred, 1)
+    grad = zeros(size(y_pred))
+    
+    # Extract components
+    pred_price_change = y_pred[:, 1]
+    pred_direction_prob = y_pred[:, 2]
+    pred_volatility = y_pred[:, 3]
+    
+    true_price_change = y_true[:, 1]
+    true_direction = y_true[:, 2]
+    true_volatility = y_true[:, 3]
+    
+    epsilon = 1e-8
+    pred_direction_prob = clamp.(pred_direction_prob, epsilon, 1 - epsilon)
+    
+    # Gradient w.r.t. direction probability
+    grad[:, 2] = weights[1] * (-true_direction ./ pred_direction_prob .+ 
+                              (1 .- true_direction) ./ (1 .- pred_direction_prob)) / N
+    
+    # Gradient w.r.t. price change prediction (asymmetric Huber)
+    price_errors = pred_price_change .- true_price_change
+    asymmetric_weights = ifelse.(price_errors .> 0, 1.0, asymmetric_penalty)
+    
+    huber_delta = 0.01
+    huber_grad = ifelse.(abs.(price_errors) .<= huber_delta,
+                        price_errors,
+                        huber_delta .* sign.(price_errors))
+    
+    grad[:, 1] = weights[2] * asymmetric_weights .* huber_grad / N
+    
+    # Gradient w.r.t. volatility prediction
+    vol_errors = pred_volatility .- true_volatility
+    time_weights = exp.(-0.1 * (N:-1:1))
+    time_weights = time_weights ./ sum(time_weights)
+    
+    grad[:, 3] = weights[4] * 2 .* time_weights .* vol_errors
+    
+    return grad
+end
