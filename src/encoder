@@ -92,7 +92,7 @@ function process_raw_data(encoder::FinancialInputEncoder,
     return features
 end
 
-Fit normalization parameters on training data
+
 function fit_normalization!(encoder::FinancialInputEncoder, features::Matrix{Float64})
     for (i, feature_name) in enumerate(encoder.feature_names)
         feature_data = features[:, i]
