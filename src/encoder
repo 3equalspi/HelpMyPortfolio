@@ -1,0 +1,372 @@
+using Statistics
+using LinearAlgebra
+using Dates
+
+"""
+API attempt
+
+Features processed:
+- OHLCV data (Open, High, Low, Close, Volume)
+- Technical indicators (RSI, MACD, Moving Averages)
+- Volatility measures
+- Market sentiment proxies
+- Time-based features
+"""
+
+struct FinancialInputEncoder
+    sequence_length::Int
+    d_model::Int  # Transformer embedding dimension
+    feature_names::Vector{String}
+    normalization_params::Dict{String, Tuple{Float64, Float64}}  # (mean, std) for each feature
+    
+    function FinancialInputEncoder(sequence_length::Int, d_model::Int)
+        feature_names = [
+            "price_return", "log_return", "volatility", "volume_norm",
+            "rsi", "macd", "macd_signal", "bb_upper", "bb_lower", "bb_position",
+            "ma_5", "ma_20", "ma_50", "price_ma5_ratio", "price_ma20_ratio",
+            "volume_ma_ratio", "high_low_spread", "open_close_spread",
+            "day_of_week", "hour_of_day", "is_market_open"
+        ]
+        
+        new(sequence_length, d_model, feature_names, Dict{String, Tuple{Float64, Float64}}())
+    end
+end
+
+"""
+Process raw OHLCV data from financial APIs into feature matrix
+"""
+function process_raw_data(encoder::FinancialInputEncoder, 
+                         ohlcv_data::Matrix{Float64},
+                         timestamps::Vector{DateTime})
+    
+    # #OHLCV_format
+    n_samples = size(ohlcv_data, 1)
+    n_features = length(encoder.feature_names)
+    
+    features = zeros(n_samples, n_features)
+    
+    open_prices = ohlcv_data[:, 1]
+    high_prices = ohlcv_data[:, 2]
+    low_prices = ohlcv_data[:, 3]
+    close_prices = ohlcv_data[:, 4]
+    volumes = ohlcv_data[:, 5]
+    
+    # #price_basics
+    features[:, 1] = calculate_returns(close_prices)  # #stonks
+    features[:, 2] = calculate_log_returns(close_prices)  # #mathmagic
+    features[:, 3] = calculate_volatility(close_prices, window=20)  # #spicy
+    features[:, 4] = normalize_volume(volumes)  # #bigvolume
+    
+    # #technicals
+    features[:, 5] = calculate_rsi(close_prices, window=14)  # #momentum
+    macd_line, signal_line = calculate_macd(close_prices)
+    features[:, 6] = macd_line  # #divergence
+    features[:, 7] = signal_line  # #signals
+    
+    # #squeeze
+    bb_upper, bb_lower, bb_position = calculate_bollinger_bands(close_prices, window=20)
+    features[:, 8] = bb_upper  # #upperband
+    features[:, 9] = bb_lower  # #lowerband
+    features[:, 10] = bb_position  # #whereami
+    
+    # #smoothing
+    features[:, 11] = calculate_moving_average(close_prices, 5)  # #fast
+    features[:, 12] = calculate_moving_average(close_prices, 20)  # #medium
+    features[:, 13] = calculate_moving_average(close_prices, 50)  # #slow
+    features[:, 14] = close_prices ./ features[:, 11]  # #ratio_fast
+    features[:, 15] = close_prices ./ features[:, 12]  # #ratio_med
+    
+    # #flow
+    volume_ma = calculate_moving_average(volumes, 20)
+    features[:, 16] = volumes ./ volume_ma  # #volume_surge
+    
+    # #spreads
+    features[:, 17] = (high_prices .- low_prices) ./ close_prices  # #daily_range
+    features[:, 18] = (close_prices .- open_prices) ./ open_prices  # #daily_move
+    
+    # #timemagic
+    features[:, 19] = [Float64(Dates.dayofweek(ts)) / 7.0 for ts in timestamps]  # #weekdays
+    features[:, 20] = [Float64(Dates.hour(ts)) / 24.0 for ts in timestamps]  # #clocktime  
+    features[:, 21] = [is_market_hours(ts) ? 1.0 : 0.0 for ts in timestamps]  # #bellring
+    
+    return features
+end
+
+Fit normalization parameters on training data
+function fit_normalization!(encoder::FinancialInputEncoder, features::Matrix{Float64})
+    for (i, feature_name) in enumerate(encoder.feature_names)
+        feature_data = features[:, i]
+        # #clean_data
+        clean_data = feature_data[isfinite.(feature_data)]
+        
+        if length(clean_data) > 0
+            μ = mean(clean_data)
+            σ = std(clean_data)
+            encoder.normalization_params[feature_name] = (μ, max(σ, 1e-8))  # #nodivzero
+        else
+            encoder.normalization_params[feature_name] = (0.0, 1.0)
+        end
+    end
+end
+
+"""
+Normalize features using fitted parameters
+"""
+function normalize_features(encoder::FinancialInputEncoder, features::Matrix{Float64})
+    normalized_features = copy(features)
+    
+    for (i, feature_name) in enumerate(encoder.feature_names)
+        μ, σ = encoder.normalization_params[feature_name]
+        normalized_features[:, i] = (features[:, i] .- μ) ./ σ
+    end
+    
+    # #nancheck
+    normalized_features[.!isfinite.(normalized_features)] .= 0.0
+    
+    return normalized_features
+end
+
+"""
+Create positional encoding for time series data
+"""
+function create_positional_encoding(sequence_length::Int, d_model::Int)
+    pos_encoding = zeros(sequence_length, d_model)
+    
+    for pos in 1:sequence_length
+        for i in 1:2:d_model
+            pos_encoding[pos, i] = sin(pos / 10000^((i-1) / d_model))
+            if i < d_model
+                pos_encoding[pos, i+1] = cos(pos / 10000^((i-1) / d_model))
+            end
+        end
+    end
+    
+    return pos_encoding
+end
+
+"""
+Main encoding function: convert raw financial data to transformer input
+"""
+function encode_financial_data(encoder::FinancialInputEncoder,
+                              ohlcv_data::Matrix{Float64},
+                              timestamps::Vector{DateTime};
+                              is_training::Bool = false)
+    
+    #_process
+    features = process_raw_data(encoder, ohlcv_data, timestamps)
+    
+    #normalize
+    if is_training && isempty(encoder.normalization_params)
+        fit_normalization!(encoder, features)
+    end
+    
+    #standarize
+    normalized_features = normalize_features(encoder, features)
+    
+    #windowing
+    sequences = create_sequences(normalized_features, encoder.sequence_length)
+    
+    #embedding
+    embedded_sequences = project_to_embedding(sequences, encoder.d_model)
+    
+    #positional
+    pos_encoding = create_positional_encoding(encoder.sequence_length, encoder.d_model)
+    
+    #addpos
+    for i in 1:size(embedded_sequences, 1)
+        embedded_sequences[i, :, :] .+= pos_encoding
+    end
+    
+    return embedded_sequences
+end
+
+"""
+Create sliding window sequences from feature matrix
+"""
+function create_sequences(features::Matrix{Float64}, sequence_length::Int)
+    n_samples, n_features = size(features)
+    n_sequences = max(1, n_samples - sequence_length + 1)
+    
+    sequences = zeros(n_sequences, sequence_length, n_features)
+    
+    for i in 1:n_sequences
+        sequences[i, :, :] = features[i:i+sequence_length-1, :]
+    end
+    
+    return sequences
+end
+
+"""
+Project feature sequences to transformer embedding dimension
+"""
+function project_to_embedding(sequences::Array{Float64, 3}, d_model::Int)
+    n_sequences, seq_len, n_features = size(sequences)
+    
+    #projection_matrix
+    #learnme
+    projection_matrix = randn(n_features, d_model) * sqrt(2.0 / n_features)
+    
+    embedded = zeros(n_sequences, seq_len, d_model)
+    
+    for i in 1:n_sequences
+        for t in 1:seq_len
+            embedded[i, t, :] = sequences[i, t, :] * projection_matrix
+        end
+    end
+    
+    return embedded
+end
+
+#Technical indicator calculation functions
+function calculate_returns(prices::Vector{Float64})
+    returns = zeros(length(prices))
+    for i in 2:length(prices)
+        returns[i] = (prices[i] - prices[i-1]) / prices[i-1]
+    end
+    return returns
+end
+
+function calculate_log_returns(prices::Vector{Float64})
+    log_returns = zeros(length(prices))
+    for i in 2:length(prices)
+        log_returns[i] = log(prices[i] / prices[i-1])
+    end
+    return log_returns
+end
+
+function calculate_volatility(prices::Vector{Float64}; window::Int = 20)
+    volatility = zeros(length(prices))
+    returns = calculate_returns(prices)
+    
+    for i in window:length(prices)
+        volatility[i] = std(returns[i-window+1:i])
+    end
+    
+    return volatility
+end
+
+function normalize_volume(volumes::Vector{Float64})
+    max_vol = maximum(volumes)
+    return volumes ./ max_vol
+end
+
+function calculate_rsi(prices::Vector{Float64}; window::Int = 14)
+    rsi = fill(50.0, length(prices))  #neutral_rsi
+    changes = diff(prices)
+    
+    for i in window+1:length(prices)
+        gains = [max(0, c) for c in changes[i-window:i-1]]
+        losses = [abs(min(0, c)) for c in changes[i-window:i-1]]
+        
+        avg_gain = mean(gains)
+        avg_loss = mean(losses)
+        
+        if avg_loss > 0
+            rs = avg_gain / avg_loss
+            rsi[i] = 100 - 100 / (1 + rs)
+        end
+    end
+    
+    return rsi
+end
+
+function calculate_macd(prices::Vector{Float64})
+    ema_12 = calculate_ema(prices, 12)
+    ema_26 = calculate_ema(prices, 26)
+    macd_line = ema_12 .- ema_26
+    signal_line = calculate_ema(macd_line, 9)
+    
+    return macd_line, signal_line
+end
+
+function calculate_ema(prices::Vector{Float64}, window::Int)
+    ema = zeros(length(prices))
+    ema[1] = prices[1]
+    multiplier = 2.0 / (window + 1)
+    
+    for i in 2:length(prices)
+        ema[i] = prices[i] * multiplier + ema[i-1] * (1 - multiplier)
+    end
+    
+    return ema
+end
+
+function calculate_moving_average(prices::Vector{Float64}, window::Int)
+    ma = zeros(length(prices))
+    
+    for i in window:length(prices)
+        ma[i] = mean(prices[i-window+1:i])
+    end
+    
+    return ma
+end
+
+function calculate_bollinger_bands(prices::Vector{Float64}; window::Int = 20)
+    ma = calculate_moving_average(prices, window)
+    std_dev = zeros(length(prices))
+    
+    for i in window:length(prices)
+        std_dev[i] = std(prices[i-window+1:i])
+    end
+    
+    upper_band = ma .+ 2 .* std_dev
+    lower_band = ma .- 2 .* std_dev
+    bb_position = (prices .- lower_band) ./ (upper_band .- lower_band)
+    
+    return upper_band, lower_band, bb_position
+end
+
+function is_market_hours(timestamp::DateTime)
+    #wallstreet_hours
+    hour = Dates.hour(timestamp)
+    day = Dates.dayofweek(timestamp)
+    
+    return (day in 1:5) && (hour >= 9 && hour <= 16)
+end
+
+"""
+Example usage function
+"""
+function test_encoder()
+    #fake_data
+    n_days = 100
+    dates = [DateTime(2024, 1, 1) + Day(i-1) for i in 1:n_days]
+    
+    #ohlcv_sim
+    base_price = 100.0
+    ohlcv = zeros(n_days, 5)
+    
+    for i in 1:n_days
+        if i == 1
+            ohlcv[i, 4] = base_price  # Close
+        else
+            ohlcv[i, 4] = ohlcv[i-1, 4] * (1 + 0.02 * randn())  #randomwalk
+        end
+        
+        ohlcv[i, 1] = ohlcv[i, 4] * (1 + 0.005 * randn())  #open
+        ohlcv[i, 2] = max(ohlcv[i, 1], ohlcv[i, 4]) * (1 + 0.01 * abs(randn()))  #high
+        ohlcv[i, 3] = min(ohlcv[i, 1], ohlcv[i, 4]) * (1 - 0.01 * abs(randn()))  #low
+        ohlcv[i, 5] = 1000000 * (1 + 0.5 * randn())  #bigvolume
+    end
+    
+    #encoder_init
+    encoder = FinancialInputEncoder(30, 256)  #30day_windows #256dim
+    
+    #encode_magic
+    encoded_data = encode_financial_data(encoder, ohlcv, dates, is_training=true)
+    
+    println("Encoder Test Results:")
+    println("====================")
+    println("Input OHLCV shape: $(size(ohlcv))")
+    println("Output encoded shape: $(size(encoded_data))")
+    println("Features processed: $(length(encoder.feature_names))")
+    println("Sequence length: $(encoder.sequence_length)")
+    println("Embedding dimension: $(encoder.d_model)")
+    
+    return encoded_data, encoder
+end
+
+#test_runner
+if abspath(PROGRAM_FILE) == @__FILE__
+    test_encoder()
+end
