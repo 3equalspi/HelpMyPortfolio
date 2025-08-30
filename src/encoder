@@ -199,23 +199,25 @@ end
 """
 Project feature sequences to transformer embedding dimension
 """
+
 function project_to_embedding(sequences::Array{Float64, 3}, d_model::Int)
     n_sequences, seq_len, n_features = size(sequences)
     
     #projection_matrix
-    #learnme
     projection_matrix = randn(n_features, d_model) * sqrt(2.0 / n_features)
     
     embedded = zeros(n_sequences, seq_len, d_model)
     
     for i in 1:n_sequences
         for t in 1:seq_len
-            embedded[i, t, :] = sequences[i, t, :] * projection_matrix
+            embedded[i, t, :] = (sequences[i, t, :]' * projection_matrix)[:]
         end
     end
     
     return embedded
 end
+
+
 
 #Technical indicator calculation functions
 function calculate_returns(prices::Vector{Float64})
