@@ -35,7 +35,7 @@ function financial_transformer_loss(y_pred, y_true, prices;
     if length(prices) > 1
         returns = diff(log.(prices))
         if std(returns) > 1e-8
-            sharpe_ratio = (mean(returns) - risk_free_rate/252) / std(returns))
+            sharpe_ratio = (mean(returns) - risk_free_rate/252) / std(returns)
             risk_loss = max(0, 1 - sharpe_ratio)
         else
             risk_loss = 1.0
